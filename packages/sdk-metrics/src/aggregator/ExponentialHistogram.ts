@@ -499,6 +499,20 @@ export class ExponentialHistogramAccumulation implements Accumulation {
 
     ours.trim();
   }
+
+  // todo: delete, for debugging
+  printBuckets() {
+    console.log('scale: %d\ncount: %d\nzero count: %d\nmin: %d\nmax: %d\nsum: %d',
+      this.scale, this.count, this.zeroCount, this.min, this.max, this.sum);
+      const buckets = this.positive;
+      for (let i = 0; i < buckets.length; i++) {
+        const index = buckets.offset + i;
+        const lower = this._mapping.lowerBoundary(index).toFixed(8);
+        const upper = this._mapping.lowerBoundary(index + 1).toFixed(8)
+        const count = buckets.at(i);
+        console.log('Bucket: (%d, %d], Count: %d, Index: %d', lower,  upper, count, index);
+      }
+  }
 }
 
 /**
