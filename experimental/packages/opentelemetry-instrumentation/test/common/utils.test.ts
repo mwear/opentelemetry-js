@@ -6,7 +6,7 @@
 import * as assert from 'assert';
 import {
   isWrapped,
-  readConfigProperties,
+  readDeclarativeConfig,
   safeExecuteInTheMiddle,
   safeExecuteInTheMiddleAsync,
 } from '../../src';
@@ -137,7 +137,7 @@ describe('safeExecuteInTheMiddleAsync', function () {
   });
 });
 
-describe('readConfigProperties', function () {
+describe('readDeclarativeConfig', function () {
   let warnings: string[];
   const diag = {
     verbose: () => {},
@@ -147,7 +147,19 @@ describe('readConfigProperties', function () {
     error: () => {},
   };
 
-  // A provider over in-memory blocks. `own` is keyed by instrumentation name.
+  interface TestConfig {
+    serverName?: string;
+    requireParent?: boolean;
+    maxLen?: number;
+    ports?: number[];
+    flags?: boolean[];
+    redactedQueryParams?: string[];
+    headersToSpanAttributes?: {
+      client?: { requestHeaders?: string[]; responseHeaders?: string[] };
+      server?: { requestHeaders?: string[]; responseHeaders?: string[] };
+    };
+  }
+
   function provider(
     own: Record<string, Record<string, unknown>> = {},
     general: Record<string, unknown> = {}
@@ -163,59 +175,67 @@ describe('readConfigProperties', function () {
     warnings = [];
   });
 
-  it('maps own-block keys onto config fields', function () {
-    const config = readConfigProperties({
+  it('maps own-block properties onto config fields', function () {
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({
         '@otel/test': { server_name: 'srv', require_parent: true },
       }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [
-        ['server_name', 'string', 'serverName'],
-        ['require_parent', 'boolean', 'requireParent'],
-      ],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        serverName: own.getString('server_name'),
+        requireParent: own.getBoolean('require_parent'),
+      }),
     });
     assert.deepStrictEqual(config, { serverName: 'srv', requireParent: true });
     assert.deepStrictEqual(warnings, []);
   });
 
-  it('omits keys absent from the config', function () {
-    const config = readConfigProperties({
+  it('omits properties absent from the config', function () {
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({ '@otel/test': {} }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [['server_name', 'string', 'serverName']],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        serverName: own.getString('server_name'),
+      }),
     });
     assert.deepStrictEqual(config, {});
     assert.deepStrictEqual(warnings, []);
   });
 
   it('warns and skips on a type mismatch', function () {
-    const config = readConfigProperties({
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({ '@otel/test': { server_name: 42 } }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [['server_name', 'string', 'serverName']],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        serverName: own.getString('server_name'),
+      }),
     });
     assert.deepStrictEqual(config, {});
     assert.strictEqual(warnings.length, 1);
     assert.match(warnings[0], /expected "string", got "number"/);
   });
 
-  it('reads a dotted source path and writes a dotted target path', function () {
-    const config = readConfigProperties({
+  it('reads a dotted path from the general block into a nested field', function () {
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider(
         {},
         { http: { client: { request_captured_headers: ['a', 'b'] } } }
       ),
-      generalProps: [
-        [
-          'http.client.request_captured_headers',
-          'string[]',
-          'headersToSpanAttributes.client.requestHeaders',
-        ],
-      ],
+      instrumentationName: '@otel/test',
+      generalDomains: ['http'],
       diag,
+      reader: (own, general): Partial<TestConfig> => ({
+        headersToSpanAttributes: {
+          client: {
+            requestHeaders: general.getStringArray(
+              'http.client.request_captured_headers'
+            ),
+          },
+        },
+      }),
     });
     assert.deepStrictEqual(config, {
       headersToSpanAttributes: { client: { requestHeaders: ['a', 'b'] } },
@@ -223,87 +243,39 @@ describe('readConfigProperties', function () {
     assert.deepStrictEqual(warnings, []);
   });
 
-  it('warns about own-block keys no mapping consumed', function () {
-    readConfigProperties({
+  it('warns about own-block properties the reader never read', function () {
+    readDeclarativeConfig<TestConfig>({
       configProvider: provider({
         '@otel/test': { server_name: 'srv', typo_key: 1 },
       }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [['server_name', 'string', 'serverName']],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        serverName: own.getString('server_name'),
+      }),
     });
     assert.strictEqual(warnings.length, 1);
     assert.match(warnings[0], /unhandled.*typo_key/);
   });
 
-  it('warns on an unsupported type tag', function () {
-    const config = readConfigProperties({
-      configProvider: provider({ '@otel/test': { port: 8080 } }),
-      instrumentationName: '@otel/test',
-      instrumentationProps: [['port', 'bogus', 'port']],
-      diag,
-    });
-    assert.deepStrictEqual(config, {});
-    assert.strictEqual(warnings.length, 1);
-    assert.match(warnings[0], /unsupported declarative config type "bogus"/);
-  });
-
-  it('warns when the target path is not walkable', function () {
-    const config = readConfigProperties({
-      configProvider: provider({
-        '@otel/test': { a: 'one', b: 'two' },
-      }),
-      instrumentationName: '@otel/test',
-      // 'serverName' is set to a string first, so 'serverName.nested' cannot be
-      // walked.
-      instrumentationProps: [
-        ['a', 'string', 'serverName'],
-        ['b', 'string', 'serverName.nested'],
-      ],
-      diag,
-    });
-    assert.deepStrictEqual(config, { serverName: 'one' });
-    assert.strictEqual(warnings.length, 1);
-    assert.match(warnings[0], /invalid target path "serverName.nested"/);
-  });
-
   it('treats an explicit null as unset, without warning', function () {
-    const config = readConfigProperties({
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({
         '@otel/test': { server_name: null, require_parent: null },
       }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [
-        ['server_name', 'string', 'serverName'],
-        ['require_parent', 'boolean', 'requireParent'],
-      ],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        serverName: own.getString('server_name'),
+        requireParent: own.getBoolean('require_parent'),
+      }),
     });
     assert.deepStrictEqual(config, {});
     assert.deepStrictEqual(warnings, []);
   });
 
-  it('treats an explicit null in the general block as unset', function () {
-    const config = readConfigProperties({
-      configProvider: provider(
-        {},
-        { http: { client: { request_captured_headers: null } } }
-      ),
-      generalProps: [
-        [
-          'http.client.request_captured_headers',
-          'string[]',
-          'headersToSpanAttributes.client.requestHeaders',
-        ],
-      ],
-      diag,
-    });
-    assert.deepStrictEqual(config, {});
-    assert.deepStrictEqual(warnings, []);
-  });
-
-  it('does not report general-block keys outside its declared domains', function () {
-    readConfigProperties({
+  it('does not report general-block properties outside its declared domains', function () {
+    readDeclarativeConfig<TestConfig>({
       configProvider: provider(
         {},
         {
@@ -312,22 +284,23 @@ describe('readConfigProperties', function () {
         }
       ),
       instrumentationName: '@otel/test',
-      instrumentationProps: [],
-      generalProps: [
-        [
-          'http.client.request_captured_headers',
-          'string[]',
-          'headersToSpanAttributes.client.requestHeaders',
-        ],
-      ],
       generalDomains: ['http'],
       diag,
+      reader: (own, general): Partial<TestConfig> => ({
+        headersToSpanAttributes: {
+          client: {
+            requestHeaders: general.getStringArray(
+              'http.client.request_captured_headers'
+            ),
+          },
+        },
+      }),
     });
     assert.deepStrictEqual(warnings, []);
   });
 
-  it('reports unmapped keys inside its declared general domains', function () {
-    readConfigProperties({
+  it('reports unread properties inside its declared general domains', function () {
+    readDeclarativeConfig<TestConfig>({
       configProvider: provider(
         {},
         {
@@ -336,43 +309,27 @@ describe('readConfigProperties', function () {
         }
       ),
       instrumentationName: '@otel/test',
-      instrumentationProps: [],
-      generalProps: [],
       generalDomains: ['http'],
       diag,
+      reader: (): Partial<TestConfig> => ({}),
     });
     assert.strictEqual(warnings.length, 1);
     assert.match(warnings[0], /unhandled.*http\.client\.known_methods/);
     assert.doesNotMatch(warnings[0], /statement_sanitizer/);
   });
 
-  it('reports no general-block keys when no domains are declared', function () {
-    readConfigProperties({
-      configProvider: provider({}, { db: { statement_sanitizer: true } }),
-      instrumentationName: '@otel/test',
-      instrumentationProps: [],
-      generalProps: [],
-      diag,
-    });
-    assert.deepStrictEqual(warnings, []);
-  });
-
   it('maps number, number[] and boolean[] properties', function () {
-    const config = readConfigProperties({
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({
-        '@otel/test': {
-          max_len: 128,
-          ports: [80, 443],
-          flags: [true, false],
-        },
+        '@otel/test': { max_len: 128, ports: [80, 443], flags: [true, false] },
       }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [
-        ['max_len', 'number', 'maxLen'],
-        ['ports', 'number[]', 'ports'],
-        ['flags', 'boolean[]', 'flags'],
-      ],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        maxLen: own.getNumber('max_len'),
+        ports: own.getNumberArray('ports'),
+        flags: own.getBooleanArray('flags'),
+      }),
     });
     assert.deepStrictEqual(config, {
       maxLen: 128,
@@ -383,11 +340,13 @@ describe('readConfigProperties', function () {
   });
 
   it('rejects NaN for number properties', function () {
-    const config = readConfigProperties({
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({ '@otel/test': { max_len: NaN } }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [['max_len', 'number', 'maxLen']],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        maxLen: own.getNumber('max_len'),
+      }),
     });
     assert.deepStrictEqual(config, {});
     assert.strictEqual(warnings.length, 1);
@@ -395,16 +354,16 @@ describe('readConfigProperties', function () {
   });
 
   it('warns when an array element has the wrong type', function () {
-    const config = readConfigProperties({
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({
         '@otel/test': { ports: [80, '443'], flags: [true, 1] },
       }),
       instrumentationName: '@otel/test',
-      instrumentationProps: [
-        ['ports', 'number[]', 'ports'],
-        ['flags', 'boolean[]', 'flags'],
-      ],
       diag,
+      reader: (own): Partial<TestConfig> => ({
+        ports: own.getNumberArray('ports'),
+        flags: own.getBooleanArray('flags'),
+      }),
     });
     assert.deepStrictEqual(config, {});
     assert.strictEqual(warnings.length, 2);
@@ -412,19 +371,14 @@ describe('readConfigProperties', function () {
     assert.match(warnings[1], /expected array of booleans/);
   });
 
-  it('keeps sibling branches of the current config when merging nested targets', function () {
-    const config = readConfigProperties({
+  it('keeps sibling branches of the current config when merging nested fields', function () {
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider(
         {},
         { http: { client: { request_captured_headers: ['from-yaml'] } } }
       ),
-      generalProps: [
-        [
-          'http.client.request_captured_headers',
-          'string[]',
-          'headersToSpanAttributes.client.requestHeaders',
-        ],
-      ],
+      instrumentationName: '@otel/test',
+      generalDomains: ['http'],
       currentConfig: {
         headersToSpanAttributes: {
           client: { responseHeaders: ['in-code-resp'] },
@@ -432,6 +386,15 @@ describe('readConfigProperties', function () {
         },
       },
       diag,
+      reader: (own, general): Partial<TestConfig> => ({
+        headersToSpanAttributes: {
+          client: {
+            requestHeaders: general.getStringArray(
+              'http.client.request_captured_headers'
+            ),
+          },
+        },
+      }),
     });
     assert.deepStrictEqual(config, {
       headersToSpanAttributes: {
@@ -444,35 +407,17 @@ describe('readConfigProperties', function () {
     });
   });
 
-  it('does not mutate the current config while merging', function () {
-    const currentConfig = {
-      headersToSpanAttributes: { server: { requestHeaders: ['keep'] } },
-    };
-    readConfigProperties({
-      configProvider: provider(
-        {},
-        { http: { client: { request_captured_headers: ['a'] } } }
-      ),
-      generalProps: [
-        [
-          'http.client.request_captured_headers',
-          'string[]',
-          'headersToSpanAttributes.client.requestHeaders',
-        ],
-      ],
-      currentConfig,
-      diag,
-    });
-    assert.deepStrictEqual(currentConfig, {
-      headersToSpanAttributes: { server: { requestHeaders: ['keep'] } },
-    });
-  });
-
-  it('returns an empty object when nothing is declared', function () {
-    const config = readConfigProperties({
+  it('warns instead of propagating an error thrown by the reader', function () {
+    const config = readDeclarativeConfig<TestConfig>({
       configProvider: provider({ '@otel/test': { server_name: 'srv' } }),
+      instrumentationName: '@otel/test',
       diag,
+      reader: (): Partial<TestConfig> => {
+        throw new Error('boom');
+      },
     });
     assert.deepStrictEqual(config, {});
+    assert.strictEqual(warnings.length, 1);
+    assert.match(warnings[0], /error reading declarative config.*boom/);
   });
 });

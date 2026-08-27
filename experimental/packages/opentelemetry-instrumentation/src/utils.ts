@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { ConfigProvider } from '@opentelemetry/api-config';
+import type {
+  ConfigProperties,
+  ConfigProvider,
+} from '@opentelemetry/api-config';
 import type { DiagLogger } from '@opentelemetry/api';
 
 import type { ShimWrapped } from './types';
@@ -119,43 +122,6 @@ function dottedGet(obj: unknown, lookup: string): unknown {
   return result;
 }
 
-/**
- * Set a value on a plain object, where `lookup` is a dotted-path to index
- * into the given object, creating empty objects as necessary. E.g.:
- *
- *   > const o = {};
- *   > dottedSet(o, 'foo.bar.baz', 42);
- *   > o
- *   { foo: { bar: { baz: 42 } } }
- *
- * Returns false, without setting anything, when the path cannot be walked.
- */
-function dottedSet(
-  obj: Record<string, unknown>,
-  lookup: string,
-  val: unknown
-): boolean {
-  let targ = obj;
-  const segs = lookup.split('.');
-  const lastSeg = segs.pop();
-  if (lastSeg === undefined) {
-    return false;
-  }
-  for (const key of segs) {
-    if (!Object.hasOwn(targ, key)) {
-      targ[key] = {};
-    }
-    const candidate = targ[key];
-    if (!isPlainObject(candidate)) {
-      return false;
-    }
-    targ = candidate;
-  }
-
-  targ[lastSeg] = val;
-  return true;
-}
-
 function isNumber(val: unknown): boolean {
   return typeof val === 'number' && !Number.isNaN(val);
 }
@@ -183,77 +149,135 @@ function flattenedKeys(obj: Record<string, unknown>, prefix = ''): string[] {
 }
 
 /**
- * Validate that the given declarative config property is of the given "type".
+ * Typed reads over one declarative config node. Each getter takes a dotted path
+ * relative to the node, and returns the value only when it is present and of
+ * the expected type. A type mismatch warns; a missing or null property is
+ * silent, so the instrumentation keeps its existing value.
  */
-function validConfigPropertyType(
-  name: string,
-  val: unknown,
-  type: string,
-  diag?: DiagLogger
-): boolean {
-  switch (type) {
-    case 'boolean':
-      if (typeof val !== 'boolean') {
-        diag?.warn(
-          `unexpected type for declarative config property "${name}": expected "boolean", got "${typeof val}"`
-        );
-        return false;
-      }
-      break;
-    case 'string':
-      if (typeof val !== 'string') {
-        diag?.warn(
-          `unexpected type for declarative config property "${name}": expected "string", got "${typeof val}"`
-        );
-        return false;
-      }
-      break;
-    case 'number':
-      if (!isNumber(val)) {
-        diag?.warn(
-          `unexpected type for declarative config property "${name}": expected "number", got "${typeof val}"`
-        );
-        return false;
-      }
-      break;
-    case 'string[]':
-      if (!isArrayOf(val, el => typeof el === 'string')) {
-        diag?.warn(
-          `unexpected type for declarative config property "${name}": expected array of strings`
-        );
-        return false;
-      }
-      break;
-    case 'boolean[]':
-      if (!isArrayOf(val, el => typeof el === 'boolean')) {
-        diag?.warn(
-          `unexpected type for declarative config property "${name}": expected array of booleans`
-        );
-        return false;
-      }
-      break;
-    case 'number[]':
-      if (!isArrayOf(val, isNumber)) {
-        diag?.warn(
-          `unexpected type for declarative config property "${name}": expected array of numbers`
-        );
-        return false;
-      }
-      break;
-    default:
-      diag?.warn(
-        `unsupported declarative config type "${type}" for property "${name}"; ignoring`
-      );
-      return false;
-  }
-  return true;
+export interface ConfigReader {
+  getBoolean(path: string): boolean | undefined;
+  getString(path: string): string | undefined;
+  getNumber(path: string): number | undefined;
+  getStringArray(path: string): string[] | undefined;
+  getBooleanArray(path: string): boolean[] | undefined;
+  getNumberArray(path: string): number[] | undefined;
 }
 
-export function readConfigProperties(opts: {
+/**
+ * Maps an instrumentation's own config node
+ * (`instrumentation/development.js.<name>`) and the shared `general` node onto
+ * instrumentation config fields. Returning `Partial<ConfigType>` is what makes
+ * the mapping type-checked: a getter whose type does not match the target
+ * field, or a field name that does not exist, fails to compile.
+ *
+ * Annotate the return type to get the full check:
+ * `(own, general): Partial<MyConfig> => ({ ... })`.
+ */
+export type DeclarativeConfigReader<ConfigType> = (
+  own: ConfigReader,
+  general: ConfigReader
+) => Partial<ConfigType>;
+
+/**
+ * Strip nullish values, recursing into plain objects and dropping any object
+ * left empty. A reader builds nested fields as object literals, so an unset
+ * property arrives as an `undefined` leaf that must not overwrite the current
+ * config.
+ */
+function pruneNullish(node: Record<string, unknown>): Record<string, unknown> {
+  const pruned: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(node)) {
+    if (val == null) {
+      continue;
+    }
+    if (isPlainObject(val)) {
+      const nested = pruneNullish(val);
+      if (Object.keys(nested).length > 0) {
+        pruned[key] = nested;
+      }
+    } else {
+      pruned[key] = val;
+    }
+  }
+  return pruned;
+}
+
+/** A ConfigReader over one node, recording which paths were read. */
+class NodeReader implements ConfigReader {
+  private readonly _node: ConfigProperties;
+  private readonly _prefix: string;
+  private readonly _readPaths: Set<string>;
+  private readonly _diag?: DiagLogger;
+
+  constructor(
+    node: ConfigProperties,
+    prefix: string,
+    readPaths: Set<string>,
+    diag?: DiagLogger
+  ) {
+    this._node = node;
+    this._prefix = prefix;
+    this._readPaths = readPaths;
+    this._diag = diag;
+  }
+
+  getBoolean(path: string): boolean | undefined {
+    return this._read(path, '"boolean"', val => typeof val === 'boolean');
+  }
+
+  getString(path: string): string | undefined {
+    return this._read(path, '"string"', val => typeof val === 'string');
+  }
+
+  getNumber(path: string): number | undefined {
+    return this._read(path, '"number"', isNumber);
+  }
+
+  getStringArray(path: string): string[] | undefined {
+    return this._read(path, 'array of strings', val =>
+      isArrayOf(val, el => typeof el === 'string')
+    );
+  }
+
+  getBooleanArray(path: string): boolean[] | undefined {
+    return this._read(path, 'array of booleans', val =>
+      isArrayOf(val, el => typeof el === 'boolean')
+    );
+  }
+
+  getNumberArray(path: string): number[] | undefined {
+    return this._read(path, 'array of numbers', val =>
+      isArrayOf(val, isNumber)
+    );
+  }
+
+  private _read<T>(
+    path: string,
+    expected: string,
+    valid: (val: unknown) => boolean
+  ): T | undefined {
+    const propName = `${this._prefix}.${path}`;
+    this._readPaths.add(propName);
+    const val = dottedGet(this._node, path);
+    // A present-but-null property means "use the default".
+    if (val === undefined || val === null) {
+      return undefined;
+    }
+    if (!valid(val)) {
+      const got = expected.startsWith('"') ? `, got "${typeof val}"` : '';
+      this._diag?.warn(
+        `unexpected type for declarative config property "${propName}": expected ${expected}${got}`
+      );
+      return undefined;
+    }
+    return val as T;
+  }
+}
+
+export function readDeclarativeConfig<ConfigType>(opts: {
   configProvider: ConfigProvider;
-  instrumentationName?: string;
-  instrumentationProps?: [string, string, string][];
-  generalProps?: [string, string, string][];
+  instrumentationName: string;
+  reader: DeclarativeConfigReader<ConfigType>;
   /**
    * The `general` domains this instrumentation is responsible for, e.g.
    * `['http']`. Unhandled properties are reported for these domains only,
@@ -261,90 +285,39 @@ export function readConfigProperties(opts: {
    */
   generalDomains?: string[];
   /**
-   * The instrumentation's current config. Nested target paths are merged over
-   * the matching branch of this, so declarative config that sets one leaf does
-   * not drop sibling leaves set in code.
+   * The instrumentation's current config. Nested fields are merged over the
+   * matching branch of this, so declarative config that sets one leaf does not
+   * drop sibling leaves set in code.
    */
   currentConfig?: Record<string, unknown>;
   diag?: DiagLogger;
-}): Record<string, unknown> {
-  // Unhandled-property reporting covers the properties this instrumentation is
-  // responsible for: its own block, plus the `general` domains it declares via
-  // `generalDomains`. The rest of `general` belongs to other instrumentations.
-  const ownedPropNames: string[] = [];
-  const handledPropNames: string[] = [];
-  const config: Record<string, unknown> = {};
-
-  if (opts.instrumentationName && opts.instrumentationProps) {
-    const instrConf = opts.configProvider.getInstrumentationConfig(
-      opts.instrumentationName
-    );
-    if (instrConf) {
-      const prefix = `instrumentation/development.js.${opts.instrumentationName}`;
-      ownedPropNames.push(...flattenedKeys(instrConf, prefix));
-
-      for (const [fromLookup, type, toLookup] of opts.instrumentationProps) {
-        const propName = prefix + '.' + fromLookup;
-        handledPropNames.push(propName);
-        const val = dottedGet(instrConf, fromLookup);
-        if (val === undefined || val === null) {
-          continue;
-        }
-        if (!validConfigPropertyType(propName, val, type, opts.diag)) {
-          continue;
-        }
-        if (!dottedSet(config, toLookup, val)) {
-          opts.diag?.warn(
-            `cannot apply declarative config property "${propName}": invalid target path "${toLookup}"`
-          );
-        }
-      }
-    }
-  }
-
-  if (opts.generalProps) {
-    const generalConf = opts.configProvider.getGeneralInstrumentationConfig();
-    if (generalConf) {
-      const prefix = 'instrumentation/development.general';
-      for (const domain of opts.generalDomains ?? []) {
-        const subtree = dottedGet(generalConf, domain);
-        if (isPlainObject(subtree)) {
-          ownedPropNames.push(...flattenedKeys(subtree, `${prefix}.${domain}`));
-        }
-      }
-
-      for (const [fromLookup, type, toLookup] of opts.generalProps) {
-        const propName = prefix + '.' + fromLookup;
-        handledPropNames.push(propName);
-        const val = dottedGet(generalConf, fromLookup);
-        if (val === undefined || val === null) {
-          continue;
-        }
-        if (!validConfigPropertyType(propName, val, type, opts.diag)) {
-          continue;
-        }
-        if (!dottedSet(config, toLookup, val)) {
-          opts.diag?.warn(
-            `cannot apply declarative config property "${propName}": invalid target path "${toLookup}"`
-          );
-        }
-      }
-    }
-  }
-
-  // Warn about unhandled properties in the config.
-  // Dev note: I'd use Set#difference, but that requires Node.js v22.
-  const unhandledPropNames = ownedPropNames.filter(
-    k => !handledPropNames.includes(k)
+}): Partial<ConfigType> {
+  const ownPrefix = `instrumentation/development.js.${opts.instrumentationName}`;
+  const generalPrefix = 'instrumentation/development.general';
+  const ownNode = opts.configProvider.getInstrumentationConfig(
+    opts.instrumentationName
   );
-  if (unhandledPropNames.length > 0) {
-    opts.diag?.warn(
-      `unhandled declarative configuration properties: ${JSON.stringify(unhandledPropNames)}`
+  const generalNode = opts.configProvider.getGeneralInstrumentationConfig();
+
+  const readPaths = new Set<string>();
+  let partial: Partial<ConfigType>;
+  try {
+    partial = opts.reader(
+      new NodeReader(ownNode, ownPrefix, readPaths, opts.diag),
+      new NodeReader(generalNode, generalPrefix, readPaths, opts.diag)
     );
+  } catch (err) {
+    // Reading declarative config must never throw out of setConfigProvider.
+    opts.diag?.warn(`error reading declarative config: ${err}`);
+    return {};
   }
 
-  // The caller merges the result with a shallow spread, so any nested branch it
-  // returns must already carry the current config's sibling values.
+  // Drop nullish fields, at every depth, so an unset property keeps the
+  // current value.
+  const config = pruneNullish(partial as Record<string, unknown>);
+
+  // Nested fields must carry the current config's siblings, because the caller
+  // merges with a shallow spread.
   const current = opts.currentConfig;
   if (current) {
     for (const [key, val] of Object.entries(config)) {
@@ -354,5 +327,22 @@ export function readConfigProperties(opts: {
     }
   }
 
-  return config;
+  // Report properties this instrumentation is responsible for but never read.
+  const ownedPropNames = flattenedKeys(ownNode, ownPrefix);
+  for (const domain of opts.generalDomains ?? []) {
+    const subtree = dottedGet(generalNode, domain);
+    if (isPlainObject(subtree)) {
+      ownedPropNames.push(
+        ...flattenedKeys(subtree, `${generalPrefix}.${domain}`)
+      );
+    }
+  }
+  const unhandledPropNames = ownedPropNames.filter(k => !readPaths.has(k));
+  if (unhandledPropNames.length > 0) {
+    opts.diag?.warn(
+      `unhandled declarative configuration properties: ${JSON.stringify(unhandledPropNames)}`
+    );
+  }
+
+  return config as Partial<ConfigType>;
 }

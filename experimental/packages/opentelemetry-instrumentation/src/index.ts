@@ -20,6 +20,6 @@ export {
   isWrapped,
   safeExecuteInTheMiddle,
   safeExecuteInTheMiddleAsync,
-  readConfigProperties,
+  readDeclarativeConfig,
 } from './utils';
 export { SemconvStability, semconvStabilityFromStr } from './semconvStability';
